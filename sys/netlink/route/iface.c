@@ -1096,12 +1096,13 @@ static int
 handle_newaddr_inet(struct nlmsghdr *hdr, struct nl_parsed_ifa *attrs,
     struct ifnet *ifp, struct nlpcb *nlp, struct nl_pstate *npt)
 {
-	if (attrs->ifa_prefixlen > 32) {
+	int plen = attrs->ifa_prefixlen;
+	int if_flags = if_getflags(ifp);
+
+	if (plen > 32) {
 		nlmsg_report_err_msg(npt, "invalid ifa_prefixlen");
 		return (EINVAL);
 	};
-
-	int if_flags = if_getflags(ifp);
 
 	if (if_flags & IFF_POINTOPOINT) {
 		if (attrs->ifa_addr == NULL || attrs->ifa_dst == NULL) {
@@ -1115,13 +1116,32 @@ handle_newaddr_inet(struct nlmsghdr *hdr, struct nl_parsed_ifa *attrs,
 		}
 		attrs->ifa_dst = attrs->ifa_broadcast;
 
-		if (attrs->ifa_dst == NULL && !(if_flags & IFF_LOOPBACK)) {
-			nlmsg_report_err_msg(npt, "empty IFA_BROADCAST for BRD interface");
-			return (EINVAL);
+		/* Generate broadcast address if not set */
+		if ((if_flags & IFF_BROADCAST) && attrs->ifa_dst == NULL) {
+			uint32_t s_baddr;
+			struct sockaddr_in *sin_brd;
+
+			if (plen == 31)
+				s_baddr = INADDR_BROADCAST; /* RFC 3021 */
+			else {
+				struct sockaddr_in *addr;
+				uint32_t s_mask;
+
+				addr = (struct sockaddr_in *)attrs->ifa_addr;
+				s_mask = htonl(plen ? ~((1 << (32 - plen)) - 1) : 0);
+				s_baddr = addr->sin_addr.s_addr | ~s_mask;
+			}
+
+			sin_brd = (struct sockaddr_in *)npt_alloc(npt, sizeof(*sin_brd));
+			if (sin_brd == NULL)
+				return (ENOMEM);
+			sin_brd->sin_family = AF_INET;
+			sin_brd->sin_len = sizeof(*sin_brd);
+			sin_brd->sin_addr.s_addr = s_baddr;
+			attrs->ifa_dst = (struct sockaddr *)sin_brd;
 		}
 	}
 
-	int plen = attrs->ifa_prefixlen;
 	struct sockaddr_in mask = {
 		.sin_len = sizeof(struct sockaddr_in),
 		.sin_family = AF_INET,
@@ -1135,7 +1155,12 @@ handle_newaddr_inet(struct nlmsghdr *hdr, struct nl_parsed_ifa *attrs,
 	if (attrs->ifa_dst != NULL)
 		req.ifra_dstaddr = *((struct sockaddr_in *)attrs->ifa_dst);
 
-	return (in_control(NULL, SIOCAIFADDR, &req, ifp, curthread));
+	int error = in_control(NULL, SIOCAIFADDR, &req, ifp, curthread);
+#ifdef INET6
+	if (error == 0 && !(if_flags & IFF_UP) && (if_getflags(ifp) & IFF_UP))
+		in6_if_up(ifp);
+#endif
+	return (error);
 }
 
 static int
@@ -1238,7 +1263,9 @@ rtnl_handle_addr(struct nlmsghdr *hdr, struct nlpcb *nlp, struct nl_pstate *npt)
 		return (ENOENT);
 	}
 
+#if defined(INET) || defined(INET6)
 	bool new = hdr->nlmsg_type == NL_RTM_NEWADDR;
+#endif
 
 	/*
 	 * TODO: Properly handle NLM_F_CREATE / NLM_F_EXCL.
